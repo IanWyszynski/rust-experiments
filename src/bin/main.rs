@@ -8,53 +8,127 @@ use rayon::prelude::*;
 
 use std::fmt::*;
 use std::fs;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::thread;
 
-const BREADTH: u32 = 5;
-const DEPTH: u32 = 3;
-
-fn main2() {
-    let g = Arc::new(Mutex::new(petgraph::graph::Graph::new()));
-
-    let handle = thread::spawn(|| {
-        let wiki = wikipedia::Wikipedia::<wikipedia::http::default::Client>::default();
-        let result = wiki.search("Feldenkrais").unwrap();
-        if result.len() == 0 {
-            println!("No results found for search.");
-            return;
-        }
-        let page = wiki.page_from_title(result[0].to_owned());
-        iterate(
-            &wiki,
-            g,
-            &mut rand::thread_rng(),
-            &page.get_title().unwrap(),
-            BREADTH,
-            0,
-        )
-        .unwrap();
-    });
-
-    handle.join().unwrap();
-    // println!("{}", Dot::new(*g.lock().unwrap()));
-}
+const BREADTH: i32 = 1;
+const DEPTH: i32 = 1;
 
 fn main() {
+    let mut graph: petgraph::graph::Graph<String, String> = petgraph::graph::Graph::new();
+
     let mut words: Vec<String> = fs::read_to_string("/usr/share/dict/words")
         .expect("Error reading dictionary")
         .lines()
-        // This is a copy
         .map(|line| line.to_owned())
         .collect();
     words.shuffle(&mut rand::thread_rng());
-    let search_terms = words[0..10].to_vec();
-    println!("Searching for terms: {:?}", search_terms);
+    let search_terms = words[0..2].to_vec();
 
     let wiki = wikipedia::Wikipedia::<wikipedia::http::default::Client>::default();
+    let wiki_ref = &wiki;
 
-    let res = search_terms
+    let updates = search_wiki(wiki_ref, &search_terms)
+        .par_iter()
+        .map(|term_to_title| {
+            let mut results = vec![];
+            crawl_from_title(wiki_ref, &term_to_title.1, &mut results, BREADTH, 0);
+            println!(
+                "Received {} results crawling '{}'",
+                results.len(),
+                term_to_title.1
+            );
+            results
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+
+    println!("Generated {} updates.", updates.len());
+
+    let (nodes, edges) = update_graph(&updates, &mut graph);
+    println!("{} nodes, {} edges", nodes, edges);
+
+    println!(
+        "Generated graph with {} nodes and {} edges",
+        graph.node_count(),
+        graph.edge_count()
+    );
+
+    println!("{}", Dot::new(&graph));
+}
+
+fn crawl_from_title(
+    wiki: &wikipedia::Wikipedia<wikipedia::http::default::Client>,
+    title: &String,
+    updates_so_far: &mut Vec<(String, String)>,
+    breadth: i32,
+    depth: i32,
+) {
+    if depth >= DEPTH {
+        return;
+    }
+    let mut links = get_wiki_links(wiki, title);
+    if links.is_empty() {
+        println!("Received no links from page '{}'", title);
+        return;
+    }
+    println!("Received {} links for page '{}'", links.len(), title);
+    links.shuffle(&mut rand::thread_rng());
+
+    updates_so_far.extend(
+        links[..std::cmp::min(breadth as usize, links.len() - 1 as usize)]
+            .par_iter()
+            .map(|linked_title| {
+                let mut updates = vec![(title.to_owned(), linked_title.to_owned())];
+                crawl_from_title(wiki, linked_title, &mut updates, breadth - 1, depth + 1);
+                updates
+            })
+            .flatten()
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn update_graph(
+    res: &Vec<(String, String)>,
+    graph: &mut petgraph::graph::Graph<String, String>,
+) -> (i32, i32) {
+    let mut tup = (0, 0);
+    let tup_ref = &mut tup;
+    res.iter().for_each(|adj| {
+        println!("IS IT HERE?");
+        // let mut src_ni;
+        let src_ni = if let Some(node_idx) = graph.node_indices().find(|ni| {
+            if graph[*ni] == adj.0 {
+                println!("found {}", adj.0);
+                true
+            } else {
+                false
+            }
+        }) {
+            println!("Returning existing node {:?}", node_idx);
+            node_idx
+        } else {
+            tup_ref.0 += 1;
+            println!("Adding {}", adj.0.to_owned());
+            graph.add_node(adj.0.to_owned())
+        };
+        let dst_ni = if let Some(node_idx) = graph.node_indices().find(|ni| graph[*ni] == adj.1) {
+            println!("Returning existing node {:?}", node_idx);
+            node_idx
+        } else {
+            tup_ref.0 += 1;
+            println!("Adding {}", adj.1.to_owned());
+            graph.add_node(adj.1.to_owned())
+        };
+        graph.add_edge(src_ni, dst_ni, "".to_owned());
+        tup_ref.1 += 1;
+    });
+    return tup;
+}
+
+fn search_wiki(
+    wiki: &wikipedia::Wikipedia<wikipedia::http::default::Client>,
+    search_terms: &Vec<String>,
+) -> Vec<(String, String)> {
+    search_terms
         .par_iter()
         .map(|term| match wiki.search(term) {
             Ok(results) => {
@@ -77,32 +151,23 @@ fn main() {
             Err(err) => println!("Lookup failed: {}", err),
         })
         .collect::<std::result::Result<Vec<(String, String)>, WikiError>>()
-        // TODO(wyszynski): Figure a better way to deal with result here.
-        .unwrap()
-        .into_iter()
-        .map(|tup| tup.1)
-        .collect::<Vec<String>>()
-        .par_iter()
-        .map(|title| {
-            wiki.page_from_title(title.to_owned())
-                .get_links()
-                .map_err(|err| {
-                    WikiError::new(format!(
-                        "Unable to get links for page '{}', cause: {}",
-                        title, err
-                    ))
-                })
-                .map(|iter| {
-                    (
-                        // TODO(wyszynski): Extra copying.
-                        title.to_owned(),
-                        iter.map(|link| link.title).collect::<Vec<_>>(),
-                    )
-                })
-        })
-        .collect::<std::result::Result<Vec<_>, WikiError>>();
+        .unwrap_or(vec![])
+}
 
-    println!("{:?}", res.unwrap());
+fn get_wiki_links(
+    wiki: &wikipedia::Wikipedia<wikipedia::http::default::Client>,
+    title: &String,
+) -> Vec<String> {
+    wiki.page_from_title(title.to_owned())
+        .get_links()
+        .map_err(|err| {
+            WikiError::new(format!(
+                "Unable to get links for page '{}', cause: {}",
+                title, err
+            ))
+        })
+        .map(|iter| iter.map(|link| link.title).collect::<Vec<_>>())
+        .unwrap_or(vec![])
 }
 
 #[derive(Debug, Clone)]
@@ -122,81 +187,4 @@ impl WikiError {
             details: msg.to_string(),
         }
     }
-}
-
-fn iterate(
-    wiki: &wikipedia::Wikipedia<wikipedia::http::default::Client>,
-    graph: Arc<Mutex<petgraph::graph::Graph<String, String>>>,
-    rng: &mut rand::rngs::ThreadRng,
-    curr_title: &std::string::String,
-    breadth: u32,
-    depth: u32,
-) -> std::result::Result<(), WikiError> {
-    let page = wiki.page_from_title(curr_title.to_owned());
-
-    // Get neighbor links.
-    let links = page.get_links().map_err(|err| {
-        WikiError::new(format!(
-            "Unable to get links for page '{}', cause: {}",
-            curr_title, err
-        ))
-    })?;
-
-    let mut next_titles = vec![];
-
-    {
-        let mut guard = graph.lock().unwrap();
-        // Get neighboring links from wikipedia that we don't already know about.
-        let mut titles: Vec<(String, petgraph::graph::NodeIndex)> = links
-            .map(|link| {
-                (
-                    link.title.clone(),
-                    guard
-                        .node_indices()
-                        .find(|n| guard[*n] == link.title.to_owned()),
-                )
-            })
-            .filter_map(|tup| {
-                if let Some(node_index) = tup.1 {
-                    Some((tup.0, node_index))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Shuffle the link titles.
-        titles.shuffle(rng);
-
-        let curr_node = guard
-            .node_indices()
-            .find(|n| guard[*n] == curr_title.to_owned())
-            .unwrap();
-
-        // Add a new node for each link and recurse.
-        next_titles = titles[0..std::cmp::min(titles.len(), breadth as usize)]
-            .iter()
-            .map(|tup| {
-                let neighbor_node = guard.add_node(tup.0.to_owned());
-                guard.add_edge(curr_node, neighbor_node, "".to_string());
-                tup.0.clone()
-            })
-            .collect();
-    }
-
-    // let v: Vec<Result<(), std::fmt::Error>> = next_titles
-    //     .par_iter()
-    //     .map(|title| {
-    //         iterate(
-    //             wiki,
-    //             Arc::clone(&graph),
-    //             &mut rand::thread_rng(),
-    //             title,
-    //             breadth - 1,
-    //             depth + 1,
-    //         ).map_err(|err| std::fmt::write())
-    //     })
-    //     .collect::<Vec<Result<(), std::fmt::Error>>>();
-
-    return Ok(());
 }
